@@ -1,0 +1,12 @@
+# Nested web dashboard repo (pushed separately to SiloMonitoringAndControlling_WebDashboard)
+silo-monitoring/
+
+# Python & runtime artifacts
+__pycache__/
+*.pyc
+*.pyo
+conveyor_bg.npz
+scan_history.jsonl
+scan_history.csv
+snapshots/
+logs/
