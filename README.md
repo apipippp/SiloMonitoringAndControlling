@@ -1,6 +1,6 @@
 # SILO MONITORING & SMART CONVEYOR — PANDUAN LENGKAP ESP32 ↔ RASPBERRY PI 3 ↔ WEB
 
-Dokumentasi lengkap dari nol hingga **auto-start penuh** untuk integrasi **ESP32 + Raspberry Pi 3 Model B + Kamera USB QR Vision + MQTT Mosquitto + Go API/SQLite + Dashboard Web Laravel + Nginx + Cloudflare Tunnel**.
+Dokumentasi lengkap dari nol hingga **auto-start penuh (jaringan lokal / LAN)** untuk integrasi **ESP32 + Raspberry Pi 3 Model B + Kamera USB QR Vision + MQTT Mosquitto + Go API/SQLite + Dashboard Web Laravel + Nginx**.
 
 > **Status Auto-Start:** Seluruh program di Raspberry Pi 3 sudah dipasang sebagai `systemd` service. **Begitu daya ESP32 dan Raspberry Pi 3 dinyalakan, semua program otomatis menyala sendiri** (~30–45 detik tanpa perlu mengetik perintah apa pun).
 
@@ -8,77 +8,66 @@ Dokumentasi lengkap dari nol hingga **auto-start penuh** untuk integrasi **ESP32
 
 ## 1. Arsitektur & Alur Data Sistem
 
-```text
-[Sensor & Aktuator]
-  DHT22 (GPIO 4) · MQ-2 (GPIO 34) · HC-SR04 (16/17)
-  L298N Motor (25/26/27) · Relay Kipas (19) · Servo Vent (18)
-  LCD I2C (21/22) · LED Hijau (13) · LED Merah (14)
-                        │
-                     [ESP32]  (esp32_silo_raspi.ino)
-                        │
-     UART2 PL011 115200 bps (disilang: D33→Pin10, D32←Pin8, GND↔Pin6)
-                        │
-            [Raspberry Pi 3 — /dev/serial0 -> ttyAMA0]
-                        │
-     ┌──────────────────┴──────────────────────────────────────┐
-     ▼                                                         │
-[silo-bridge.service :5000]                                    │
-  raspi_qr_bridge.py                                           │
-  - Baca telemetri & SCAN_REQ dari ESP32                       │
-  - Kamera USB /dev/video0 (640x360 MJPG, fokus=75 -> V4L2 301)│
-  - Deteksi ROI Conveyor + decode QR (pyzbar + OpenCV)         │
-  - Kirim balik SCAN_VALID / SCAN_INVALID / ITEM_CLEARED       │
-  - Publish telemetri & QR valid + JPEG snapshot ke MQTT       │
-  - Terima perintah kontrol dashboard dari MQTT -> ESP32       │
-     │                                                         │
-     ▼ MQTT lokal (tcp://127.0.0.1:1883 — mosquitto.service)   │
-     │                                                         │
-[silo-api.service :3000]  (Go ARM64 + SQLite data/silo.db)     │
-  - Simpan tabel readings, scans (+ file JPEG snapshots/), events
-  - REST API + JWT Auth (/api/telemetri, /api/tracking, /api/kontrol)
-     ▲                                                         │
-     │ HTTP REST                                               │
-[silo-web.service :8000]  (Laravel Blade + Vanilla JS)         │
-  - /           : Ringkasan grafik suhu, lembab, gas, log      │
-  - /kendali    : Halaman khusus Mode AUTO/MANUAL & switch     │
-  - /tracking   : Riwayat box kopi + JSON + foto kamera        │
-     ▲                                                         │
-     ├──────────────────┐                                      │
-     ▼                  ▼                                      │
-[nginx.service :8080] (1 pintu Reverse Proxy)                  │
-  - /       -> 127.0.0.1:8000 (Laravel Dashboard)              │
-  - /api/   -> 127.0.0.1:3000 (Go API + Snapshot)              │
-  - /cam/   -> 127.0.0.1:5000 (Live Kamera Vision, no buffer)  │
-     │                                                         │
-     ▼                                                         │
-[silo-tunnel.service] (Cloudflare Tunnel -> HTTPS publik)      │
-  - Bisa diakses dari HP kuota / Wi-Fi mana saja               │
+```mermaid
+flowchart TD
+    subgraph HW["Hardware & Field Layer (ESP32)"]
+        SENS["Sensor: DHT22 (GPIO4) · MQ-2 (GPIO34) · HC-SR04 (16/17)"]
+        ESP["ESP32 (esp32_silo_raspi.ino) — PID Conveyor & Control"]
+        ACT["Aktuator: L298N (25/26/27) · Kipas (19) · Vent (18) · LCD (21/22) · LED (13/14)"]
+        SENS --> ESP
+        ESP --> ACT
+    end
+
+    subgraph RPI["Raspberry Pi 3 (systemd Auto-Start)"]
+        CAM["Kamera USB /dev/video0 (640x360 MJPG, Fokus=75 / V4L2 301)"]
+        BRIDGE["silo-bridge.service (:5000) — raspi_qr_bridge.py (ROI + QR + Live MJPEG)"]
+        MQTT["mosquitto.service (:1883) — Local MQTT Broker"]
+        API["silo-api.service (:3000) — Go Fiber API + SQLite (silo.db & snapshots)"]
+        WEB["silo-web.service (:8000) — Laravel Dashboard (/, /kendali, /tracking)"]
+        NGINX["nginx.service (:8080) — Reverse Proxy Lokal 1 Pintu"]
+
+        CAM --> BRIDGE
+        BRIDGE <-->|"Telemetri & QR+Foto / Kontrol"| MQTT
+        MQTT <-->|"Simpan DB / Publish Kontrol"| API
+        WEB <-->|"HTTP REST /api/*"| API
+        NGINX -->|"/ → :8000"| WEB
+        NGINX -->|"/api/ → :3000"| API
+        NGINX -->|"/cam/ → :5000 (no buffer)"| BRIDGE
+    end
+
+    ESP <-->|"UART2 PL011 115200 bps (D33 → Pin10, D32 ← Pin8, GND ↔ Pin6)"| BRIDGE
+
+    LAN["Browser LAN / Hotspot: http://IP-RASPI:8080/ atau http://silo.local:8080/"]
+    LAN <--> NGINX
 ```
+
+**Ringkasan alur data 2 arah:**
+1. **Monitoring & QR Scan (Hardware → Web):** `ESP32` mengirim `TELEM` & `SCAN_REQ` lewat **UART2 PL011 (`/dev/serial0 -> ttyAMA0`)** ke `raspi_qr_bridge.py` (`:5000`). Kamera memindai QR di ROI conveyor, membalas `SCAN_VALID` / `SCAN_INVALID` / `ITEM_CLEARED` ke ESP32, lalu mem-publish telemetri & QR valid beserta foto JPEG ke `Mosquitto` (`:1883`) → disimpan `Go API` (`:3000`) ke SQLite → ditampilkan `Laravel Dashboard` (`:8000`) lewat 1 pintu `Nginx` (`:8080`).
+2. **Kendali Perangkat (Web → Hardware):** Switch di halaman `/kendali` (Mode `AUTO`/`MANUAL`, Kipas, Ventilasi, Konveyor) dikirim `Laravel` → `Go API` → `Mosquitto` → `raspi_qr_bridge.py` → diteruskan lewat **UART2** ke `ESP32`.
 
 ---
 
 ## 2. Struktur Folder Proyek
 
 ```text
-Silo ESP RASPI/
+SiloMonitoringAndControlling/
 ├── esp32_silo_raspi/
 │   └── esp32_silo_raspi.ino       # Firmware ESP32 (PID pelan halus + anti-stall + UART2 + LED)
 ├── raspi_qr_bridge.py             # Bridge Raspi (Kamera ROI + QR + UART2 + MQTT + Web :5000)
-├── silo-monitoring/
-│   ├── backend/                   # Go API + SQLite + binary silo-api-arm64 + .env
-│   └── frontend-silo/             # Laravel Dashboard (/, /kendali, /tracking)
-├── raspi_deploy/                  # Backup seluruh config Raspi (systemd, nginx, mosquitto, skrip)
+├── raspi_deploy/                  # Backup config lokal Raspi (systemd, nginx, mosquitto, skrip)
 │   ├── nginx_silo.conf
 │   ├── mosquitto_silo.conf
 │   ├── silo-api.service
 │   ├── silo-web.service
 │   ├── silo-bridge.service
-│   ├── silo-tunnel.service
 │   ├── start_web.sh
 │   ├── start_silo.sh
 │   └── stop_all.sh
+├── DATASET/                       # Dataset gambar uji box kopi & QR (19 gambar)
 └── README.md
 ```
+
+> **Repo Web Dashboard (terpisah):** Backend Go + Frontend Laravel tersedia di [`SiloMonitoringAndControlling_WebDashboard`](https://github.com/apipippp/SiloMonitoringAndControlling_WebDashboard).
 
 ---
 
@@ -165,11 +154,6 @@ sudo apt install -y \
   v4l2-utils sqlite3 nginx-light \
   php-cli php-curl php-mbstring php-xml php-sqlite3
 ```
-Install `cloudflared` (ARM64):
-```bash
-curl -fsSL -o /tmp/cloudflared.deb https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-arm64.deb
-sudo dpkg -i /tmp/cloudflared.deb && rm -f /tmp/cloudflared.deb
-```
 
 ### Langkah 4 — Konfigurasi Mosquitto MQTT Lokal
 Salin `raspi_deploy/mosquitto_silo.conf` ke `/etc/mosquitto/conf.d/silo.conf`:
@@ -221,46 +205,38 @@ Salin seluruh file `*.service` dari `raspi_deploy/` ke `/etc/systemd/system/`:
 | `silo-api.service` | `3000` | Backend Go + SQLite (`data/silo.db` & `data/snapshots/`) |
 | `silo-web.service` | `8000` | Frontend Web Laravel (`/`, `/kendali`, `/tracking`) |
 | `silo-bridge.service` | `5000` | Kamera USB (`640x360 MJPG`, `--focus 75` = V4L2 `301` + auto-nudge frame 5, `brightness=4`, `contrast=13`, `sharpness=11`) + UART2 + MQTT |
-| `nginx.service` | `8080` | Reverse proxy 1 pintu (`/`, `/api/`, `/cam/`) |
-| `silo-tunnel.service` | HTTPS | Cloudflare Tunnel menuju `127.0.0.1:8080` |
+| `nginx.service` | `8080` | Reverse proxy lokal 1 pintu (`/`, `/api/`, `/cam/`) |
 
 Aktifkan semuanya agar **otomatis menyala setiap Raspi dihidupkan**:
 ```bash
 sudo systemctl daemon-reload
-sudo systemctl enable --now mosquitto silo-api silo-web silo-bridge nginx silo-tunnel
+sudo systemctl enable --now mosquitto silo-api silo-web silo-bridge nginx
 ```
 
 ---
 
 ## 6. Operasional Harian (Saat Nyala & Saat Mematikan)
 
-### A. Alamat Web Permanen (Publik HTTPS & LAN)
-Tunnel permanen (`cloudflared.service`, tunnel `tekkom-project`) sudah aktif dan **otomatis menyala setiap Raspi dihidupkan**:
+### A. Alamat Akses Web Lokal (LAN / Hotspot yang Sama)
+Semua layanan berjalan lokal di Raspberry Pi (`<IP-RASPI>` bisa dicek lewat `hostname -I`, atau gunakan mDNS `silo.local`):
 
-- **Dashboard Ringkasan:** `https://silo.apipnurrr.my.id/`
-- **Kendali Perangkat:** `https://silo.apipnurrr.my.id/kendali`
-- **Riwayat Tracking + Foto:** `https://silo.apipnurrr.my.id/tracking`
-- **Live Kamera Vision:** `https://silo.apipnurrr.my.id/cam/`
-- **API Go:** `https://silo.apipnurrr.my.id/api/health`
+**Lewat 1 Pintu Nginx (`:8080` — direkomendasikan):**
+- **Dashboard Ringkasan:** `http://<IP-RASPI>:8080/` (atau `http://silo.local:8080/`)
+- **Kendali Perangkat:** `http://<IP-RASPI>:8080/kendali`
+- **Riwayat Tracking + Foto:** `http://<IP-RASPI>:8080/tracking`
+- **Live Kamera Vision:** `http://<IP-RASPI>:8080/cam/`
+- **API Go:** `http://<IP-RASPI>:8080/api/health`
 
-Akses di jaringan lokal (LAN/hotspot yang sama):
-- **Dashboard 1 Pintu (Nginx):** `http://10.12.64.103:8080/` (atau `http://silo.local:8080/`)
-- **Kendali Perangkat:** `http://10.12.64.103:8080/kendali`
-- **Riwayat Tracking + Foto:** `http://10.12.64.103:8080/tracking`
-- **Live Kamera Vision:** `http://10.12.64.103:8080/cam/`
+**Akses Langsung per Port (tanpa Nginx):**
+- **Laravel Dashboard:** `http://<IP-RASPI>:8000/`
+- **Go API + SQLite:** `http://<IP-RASPI>:3000/api/health`
+- **Live Kamera Vision:** `http://<IP-RASPI>:5000/`
+- **MQTT Broker:** `tcp://<IP-RASPI>:1883`
 
-### B. Cara Pasang Ulang Token Cloudflare Tunnel (Jika Install Ulang Raspi)
-1. Pastikan Nameserver `apipnurrr.my.id` di IDWebhost menunjuk `georgia.ns.cloudflare.com` & `morgan.ns.cloudflare.com` (status **Active** di Cloudflare).
-2. Di Cloudflare (`dash.cloudflare.com` → **Networking → Tunnels → `tekkom-project`**) pastikan route `silo.apipnurrr.my.id` → `http://127.0.0.1:8080` aktif.
-3. Pasang service di Raspi:
-   ```bash
-   sudo cloudflared service install <TOKEN_EYJ_DARI_CLOUDFLARE>
-   ```
-
-### C. Perintah Cek Status, Log, & Shutdown Aman
+### B. Perintah Cek Status, Log, & Shutdown Aman
 ```bash
-# Cek seluruh 6 service sekaligus
-systemctl is-active mosquitto silo-api silo-web silo-bridge nginx cloudflared
+# Cek seluruh 5 service lokal sekaligus
+systemctl is-active mosquitto silo-api silo-web silo-bridge nginx
 
 # Lihat log bridge kamera/UART secara live
 journalctl -u silo-bridge -f
